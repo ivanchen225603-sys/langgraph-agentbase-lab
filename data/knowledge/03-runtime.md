@@ -11,5 +11,3 @@ LangGraph interrupt 用于等待人工输入，取消通过 asyncio 任务取消
 检查点不保证外部系统 exactly-once；外部写成功但收据丢失必须进入 needs_reconciliation，禁止自动重放。
 
 SQLite 适合单机教学且一次只能有一个写者，当前应用只支持单进程，不承诺十万 QPS 或生产 SLA。
-
-\n
