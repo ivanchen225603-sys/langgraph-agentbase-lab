@@ -51,5 +51,3 @@ files = ["raglab", "agentbase"]
 
 [tool.pydantic-mypy]
 init_typed = false
-
-\n
