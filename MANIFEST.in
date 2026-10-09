@@ -1,0 +1,14 @@
+include requirements.lock Dockerfile compose.yaml .env.example .gitignore .dockerignore .gitattributes
+recursive-include raglab/web *.html *.css *.js *.mjs
+include examples/__init__.py examples/agentbase_server.py examples/agentbase.json
+include examples/agentbase_enhancements.py
+include scripts/bootstrap_index.py scripts/backup.py
+prune tests
+prune docs
+prune .github
+prune .ai-lifecycle
+prune evidence
+exclude requirements-dev.lock
+exclude .env
+global-exclude *.md *.pyc
+include data/knowledge/01-rag.md data/knowledge/02-memory.md data/knowledge/03-runtime.md data/knowledge/04-systems.md

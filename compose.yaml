@@ -1,0 +1,27 @@
+services:
+  lab:
+    build: .
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      LAB_MODE: local
+      LAB_HOST: 0.0.0.0
+      LAB_AUTH_MODE: bearer
+      LAB_BEARER_PRINCIPALS: '${LAB_BEARER_PRINCIPALS:?Set a server-side JSON token-to-owner map; token must have at least 24 characters}'
+      LAB_DATA_DIR: /state
+      LAB_KNOWLEDGE_ROOT: /app/data/knowledge
+      LAB_ENABLE_SIMULATION: "false"
+    volumes:
+      - lab_state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 2.0
+    restart: "no"
+volumes:
+  lab_state:
