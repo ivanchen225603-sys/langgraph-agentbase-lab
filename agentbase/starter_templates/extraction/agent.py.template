@@ -59,7 +59,7 @@ async def offline_response(request):
     record = re.search(r"\brecord_id\s*[:：]\s*(REC-\d+)\b", text)
     label_value = None
     for line in text.splitlines():
-        label = re.search(r"\blabel[ \t]*[:：]([^;]*)", line)
+        label = re.search(r"\blabel\s*[:：]([^;]*)", line)
         if label:
             label_value = label.group(1).strip() or None
             break

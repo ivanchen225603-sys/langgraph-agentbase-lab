@@ -403,7 +403,7 @@ def load_starter(template, directory):
         pytest.param("label:\u2028enabled: true", None, True, id="unicode-line"),
         pytest.param("label:\u2029enabled: false", None, False, id="unicode-paragraph"),
         pytest.param("label\n: alpha\nenabled: true", None, True, id="colon-next-line"),
-        pytest.param("label \t: alpha", "alpha", None, id="horizontal-spacing"),
+        pytest.param("label \t\u3000: alpha", "alpha", None, id="horizontal-spacing"),
         pytest.param("label: alpha; enabled: true", "alpha", True, id="semicolon"),
         pytest.param("label: alpha beta\nenabled: false", "alpha beta", False, id="multiline"),
         pytest.param("label： 示例\nenabled: true", "示例", True, id="unicode-value"),
