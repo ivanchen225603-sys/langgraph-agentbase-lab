@@ -6,6 +6,7 @@
     ".dockerignore",
     ".env.example",
     ".gitattributes",
+    ".github/workflows/generic-validation.yml",
     ".gitignore",
     "AGENTS.md",
     "Dockerfile",

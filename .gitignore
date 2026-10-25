@@ -180,3 +180,10 @@ desktop.ini
 !/tests/test_subprocess.py
 !/tests/test_tool_attempt_policy.py
 !/tests/test_verify_offline.py
+
+# One reviewed validation workflow; keep other local GitHub material private.
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/generic-validation.yml

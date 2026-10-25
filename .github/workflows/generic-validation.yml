@@ -1,0 +1,210 @@
+name: Generic delivery validation
+
+# A new workflow cannot be dispatched until it exists on the default branch.
+# This exact branch push enables initial validation without changing main.
+on:
+  push:
+    branches: [codex/ci-generic-offline]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generic-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'ivanchen225603-sys/langgraph-agentbase-lab' && github.ref == 'refs/heads/codex/ci-generic-offline'
+    name: ${{ matrix.mode }} / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    # Whole job budget; the original per-check timeout remains 1200 seconds.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {os: ubuntu-24.04, python: '3.11', mode: offline}
+          - {os: ubuntu-24.04, python: '3.12', mode: offline}
+          - {os: windows-2025, python: '3.11', mode: offline}
+          - {os: windows-2025, python: '3.12', mode: offline}
+          - {os: ubuntu-24.04, python: '3.11', mode: audit}
+          - {os: ubuntu-24.04, python: '3.11', mode: docker}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONDONTWRITEBYTECODE: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      LAB_MODE: local
+      LANGSMITH_TRACING: 'false'
+      LANGCHAIN_TRACING_V2: 'false'
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Set up Node
+        if: matrix.mode == 'offline'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Export and bind reviewed source
+        shell: python
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          import hashlib, json, os, platform, re, subprocess, sys, zipfile
+          from pathlib import Path
+          sha = os.environ['SOURCE_SHA']
+          assert re.fullmatch(r'[0-9a-f]{40}', sha)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == sha
+          assert not subprocess.check_output(['git', 'status', '--porcelain']).strip()
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          archive, target = temporary / 'reviewed-source.zip', temporary / 'reviewed-export'
+          assert not archive.exists() and not target.exists()
+          subprocess.run(['git', 'archive', '--format=zip', '--output=' + str(archive), sha], check=True)
+          with zipfile.ZipFile(archive) as package:
+              assert package.comment.decode() == sha and package.testzip() is None
+              package.extractall(target)
+          sys.path.insert(0, str(target))
+          from scripts.verify_offline import fingerprint, inputs
+          names = inputs(target)
+          tracked = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')[:-1]
+          assert set(names) == set(tracked), 'Every tracked file must be reviewed and hashed'
+          evidence = target / 'evidence/ci'
+          evidence.mkdir(parents=True)
+          record = dict(source_commit=sha, python=platform.python_version(), platform=platform.platform(),
+                        archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+                        source_baseline=fingerprint(target, names))
+          (evidence / 'source.json').write_text(json.dumps(record, indent=2), encoding='utf-8')
+      - name: Install exact reviewed development pins
+        if: matrix.mode != 'docker'
+        working-directory: ${{ runner.temp }}/reviewed-export
+        run: python -m pip install --no-deps -r requirements-dev.lock
+      - name: Run original offline gate
+        if: matrix.mode == 'offline'
+        working-directory: ${{ runner.temp }}/reviewed-export
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        shell: python
+        run: |
+          import json, os, subprocess, sys
+          from pathlib import Path
+          argv = [sys.executable, '-m', 'scripts.verify_offline', '--evidence-dir', 'evidence/full',
+                  '--build-dir', 'dist/full', '--source-commit', os.environ['SOURCE_SHA']]
+          with Path('evidence/ci/offline.log').open('w', encoding='utf-8') as log:
+              result = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT)
+          Path('evidence/ci/offline-process.json').write_text(
+              json.dumps(dict(argv=argv, actual_exit_code=result.returncode)), encoding='utf-8')
+          raise SystemExit(result.returncode)
+      - name: Audit locked dependencies without fixing them
+        if: matrix.mode == 'audit'
+        working-directory: ${{ runner.temp }}/reviewed-export
+        shell: python
+        run: |
+          import json, subprocess, sys
+          from pathlib import Path
+          def pins(name):
+              return dict(line.lower().replace('_', '-').split('==')
+                          for line in Path(name).read_text().splitlines())
+          development, runtime = pins('requirements-dev.lock'), pins('requirements.lock')
+          assert all(development.get(name) == version for name, version in runtime.items())
+          argv = [sys.executable, '-m', 'pip_audit', '-r', 'requirements-dev.lock', '--no-deps',
+                  '--disable-pip', '--strict', '--progress-spinner', 'off', '--format', 'json',
+                  '--output', 'evidence/ci/audit.json']
+          with Path('evidence/ci/audit.log').open('w', encoding='utf-8') as log:
+              result = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, timeout=1200)
+          Path('evidence/ci/audit-process.json').write_text(
+              json.dumps(dict(argv=argv, actual_exit_code=result.returncode)), encoding='utf-8')
+          if result.returncode:
+              raise SystemExit(result.returncode)
+          report = json.loads(Path('evidence/ci/audit.json').read_text())
+          dependencies = report['dependencies']
+          assert len(dependencies) == len(development)
+          assert {x['name'].lower().replace('_', '-'): x['version'] for x in dependencies} == development
+          assert all(not x.get('skip_reason') and not x['vulns'] for x in dependencies)
+      - name: Validate non-production Docker service
+        if: matrix.mode == 'docker'
+        working-directory: ${{ runner.temp }}/reviewed-export
+        shell: python
+        run: |
+          import json, os, secrets, subprocess, sys
+          from pathlib import Path
+          token = secrets.token_urlsafe(32)
+          environment = dict(os.environ, LAB_BEARER_PRINCIPALS=json.dumps({token: 'ci-runner'}))
+          project = 'ci-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          compose = ['docker', 'compose', '--project-name', project]
+          records, code = [], 1
+          def run(name, argv, timeout=1200):
+              result = subprocess.run(argv, env=environment, capture_output=True, text=True, timeout=timeout)
+              Path('evidence/ci/' + name + '.log').write_text(
+                  (result.stdout + result.stderr).replace(token, '<ephemeral>'), encoding='utf-8')
+              records.append(dict(check=name, actual_exit_code=result.returncode))
+              result.check_returncode()
+              return result.stdout
+          try:
+              run('docker-version', ['docker', 'version'])
+              run('compose-config', compose + ['config', '--quiet'])
+              run('docker-build', compose + ['build', '--pull'])
+              run('docker-start', compose + ['up', '--detach', '--wait', '--wait-timeout', '120'])
+              probe = """
+          import json, os, urllib.error, urllib.request
+          assert os.getuid() == 10001
+          base = 'http://127.0.0.1:8001'
+          assert json.load(urllib.request.urlopen(base + '/health/ready', timeout=5))['ready']
+          try:
+              urllib.request.urlopen(base + '/api/v1/config', timeout=5)
+          except urllib.error.HTTPError as error:
+              assert error.code == 401
+          else:
+              raise AssertionError('Unauthenticated access succeeded')
+          token = next(iter(json.loads(os.environ['LAB_BEARER_PRINCIPALS'])))
+          request = urllib.request.Request(base + '/api/v1/config', headers={'Authorization': 'Bearer ' + token})
+          config = json.load(urllib.request.urlopen(request, timeout=5))
+          assert config['mode'] == 'local' and config['auth_mode'] == 'bearer' and config['principal'] == 'ci-runner'
+          print('Synthetic local readiness, non-root user and bearer boundary passed')
+          """
+              run('docker-probe', compose + ['exec', '-T', 'lab', 'python', '-c', probe], timeout=60)
+              container = run('container-id', compose + ['ps', '-q', 'lab']).strip()
+              inspect = json.loads(subprocess.check_output(['docker', 'inspect', container], env=environment))[0]
+              host = inspect['HostConfig']
+              assert host['ReadonlyRootfs'] and 'ALL' in host['CapDrop']
+              assert 'no-new-privileges:true' in host['SecurityOpt']
+              assert all(x['HostIp'] == '127.0.0.1' for x in host['PortBindings']['8001/tcp'])
+              Path('evidence/ci/docker-image.json').write_text(
+                  json.dumps(dict(image_id=inspect['Image'], hardening_verified=True)), encoding='utf-8')
+              code = 0
+          finally:
+              try:
+                  run('docker-logs', compose + ['logs', '--no-color'], timeout=60)
+              except Exception:
+                  code = 1
+                  raise
+              finally:
+                  try:
+                      run('docker-cleanup', compose + ['down', '--volumes', '--remove-orphans'], timeout=120)
+                  except Exception:
+                      code = 1
+                      raise
+                  finally:
+                      Path('evidence/ci/docker-process.json').write_text(
+                          json.dumps(dict(actual_exit_code=code, checks=records)), encoding='utf-8')
+          raise SystemExit(code)
+      - name: Preserve source hashes and gate outcomes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generic-${{ matrix.mode }}-${{ matrix.os }}-py${{ matrix.python }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/reviewed-export/evidence/
+            ${{ runner.temp }}/reviewed-export/dist/full/
+          if-no-files-found: error
+          retention-days: 14
