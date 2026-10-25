@@ -57,11 +57,16 @@ async def offline_response(request):
         next(message.content for message in reversed(request.messages) if message.role == "user")
     )["text"]
     record = re.search(r"\brecord_id\s*[:：]\s*(REC-\d+)\b", text)
-    label = re.search(r"\blabel\s*[:：]\s*([^;\n]+)", text)
+    label_value = None
+    for line in text.splitlines():
+        label = re.search(r"\blabel[ \t]*[:：]([^;]*)", line)
+        if label:
+            label_value = label.group(1).strip() or None
+            break
     enabled = re.search(r"\benabled\s*[:：]\s*(true|false)\b", text, re.IGNORECASE)
     value = {
         "record_id": record.group(1) if record else None,
-        "label": label.group(1).strip() if label else None,
+        "label": label_value,
         "enabled": enabled.group(1).lower() == "true" if enabled else None,
     }
     return ModelResponse(text=json.dumps(value, ensure_ascii=False))

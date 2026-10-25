@@ -387,6 +387,41 @@ def load_starter(template, directory):
     return module
 
 
+@pytest.mark.parametrize(
+    "text,label,enabled",
+    [
+        pytest.param("enabled: true", None, True, id="missing"),
+        pytest.param("label:", None, None, id="empty"),
+        pytest.param("label:   ", None, None, id="spaces"),
+        pytest.param("label:\t", None, None, id="tab"),
+        pytest.param("label: \u3000", None, None, id="unicode-space"),
+        pytest.param("label: ; enabled: false", None, False, id="empty-before-semicolon"),
+        pytest.param("label:\nenabled: true", None, True, id="lf"),
+        pytest.param("label: \t\r\nenabled: true", None, True, id="crlf"),
+        pytest.param("label:\renabled: false", None, False, id="cr"),
+        pytest.param("label:\n \nenabled: false", None, False, id="blank-line"),
+        pytest.param("label:\u2028enabled: true", None, True, id="unicode-line"),
+        pytest.param("label:\u2029enabled: false", None, False, id="unicode-paragraph"),
+        pytest.param("label\n: alpha\nenabled: true", None, True, id="colon-next-line"),
+        pytest.param("label \t: alpha", "alpha", None, id="horizontal-spacing"),
+        pytest.param("label: alpha; enabled: true", "alpha", True, id="semicolon"),
+        pytest.param("label: alpha beta\nenabled: false", "alpha beta", False, id="multiline"),
+        pytest.param("label： 示例\nenabled: true", "示例", True, id="unicode-value"),
+        pytest.param("label: beta", "beta", None, id="label-only"),
+    ],
+)
+async def test_extraction_label_stays_on_same_line_and_blank_is_null(
+    tmp_path, text, label, enabled
+):
+    module = load_starter("extraction", tmp_path / "extraction")
+    request = SimpleNamespace(
+        messages=[SimpleNamespace(role="user", content=json.dumps({"text": text}))]
+    )
+    response = await module.offline_response(request)
+    assert json.loads(response.text) == {"record_id": None, "label": label, "enabled": enabled}
+    assert response.tool_calls == []
+
+
 @pytest.mark.parametrize("template", ["extraction", "confirmed-action"])
 async def test_starter_cli_wait_uses_bound_budget_for_submit_and_resume(
     tmp_path, monkeypatch, template
