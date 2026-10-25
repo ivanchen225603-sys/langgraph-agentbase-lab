@@ -1,5 +1,7 @@
 """可复用的 Agent 契约与运行时组件，不依赖任何业务场景。"""
 
+from .adapters import ToolBinding, build_registry, function_tool, langchain_tool
+from .application import create_agent_app, open_runtime
 from .artifact_tools import artifact_read_tool
 from .artifacts import (
     ArtifactInfo,
@@ -34,10 +36,17 @@ from .effects import (
 from .http import AgentHttpLimits, mount_agent_routes
 from .planning import PlanningTask, PlanProposal
 from .registry import ComponentRegistry, RegistrationSelection
+from .storage import MemoryLimits
 from .task_tree import ChildReceiptReference, ChildTask
 from .tools import ResolvedTool, ToolResolver
 
 __all__ = [
+    "ToolBinding",
+    "build_registry",
+    "function_tool",
+    "langchain_tool",
+    "open_runtime",
+    "create_agent_app",
     "ArtifactInfo",
     "ChildTask",
     "ChildReceiptReference",
@@ -66,6 +75,7 @@ __all__ = [
     "AgentHttpLimits",
     "AgentPackage",
     "ComponentRegistry",
+    "MemoryLimits",
     "RegistrationSelection",
     "ResolvedTool",
     "ToolDeclaration",

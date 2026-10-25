@@ -35,6 +35,7 @@ from .model_calls import ModelCaller
 from .registry import BoundAgent, ComponentRegistry
 from .run_store import SqliteRunStore
 from .runtime_contracts import (
+    AdmissionFence,
     AgentAuthorizer,
     EngineSettings,
     FinalProjection,
@@ -42,6 +43,7 @@ from .runtime_contracts import (
     IdentityResolver,
     PreparedAdmission,
     RunOptions,
+    checked_admission_metadata,
 )
 from .schema import SchemaContract, canonical_json, content_digest
 from .task_execution import TaskCoordinator, TaskTicket
@@ -92,6 +94,10 @@ class RunEngine:
         self.workers: list[asyncio.Task] = []
         self._ever_started = False
         self.active: dict[str, asyncio.Task] = {}
+        # Own cancellation finalization independently of the HTTP caller. Execution
+        # keeps its worker/tool slots until it actually exits; admission is separate.
+        self._cancellations: dict[str, asyncio.Task] = {}
+        self._close_task: asyncio.Task | None = None
         self.pending: set[str] = set()
         self.admission_lock = asyncio.Lock()
         self.available, self.closing = True, False
@@ -356,8 +362,11 @@ class RunEngine:
         return {"configurable": {"thread_id": row["thread"], "runtime_run_id": row["run_id"]}}
 
     async def start(self):
+        if self._close_task is not None and not self._close_task.done():
+            raise AgentError("not_accepting", "runtime is shutting down", 503)
         if self.workers:
             return
+        self._close_task = None
         self.closing = False
         self._ever_started = True
         self.workers = [asyncio.create_task(self.worker()) for _ in range(self.settings.workers)]
@@ -403,12 +412,27 @@ class RunEngine:
 
     async def close(self):
         self.closing = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._drain_close())
+        closing = self._close_task
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        closing.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _drain_close(self):
         await self.task_coordinator.close()
         # 先让执行完取消清理，再停止其等待中的 worker。
         remaining = list(self.active.values())
         for task in remaining:
             self.cancel_once(task)
         await asyncio.gather(*remaining, return_exceptions=True)
+        await asyncio.gather(*list(self._cancellations.values()), return_exceptions=True)
         for task in self.workers:
             self.cancel_once(task)
         await asyncio.gather(*self.workers, return_exceptions=True)
@@ -454,11 +478,22 @@ class RunEngine:
             else content_digest({"input": value, "options": options.model_dump(mode="json")})
         )
 
-    async def _idempotent_view(self, existing, value, options):
+    async def _idempotent_view(self, existing, value, options, fence: AdmissionFence | None = None):
         # 即使当前 Schema 已变更，请求契约仍归原始发布版本所有。
         digest = self.client_request_digest(self.binding(existing), value, options)
         if self._control(existing)["client_digest"] != digest:
             raise AgentError("idempotency_conflict", "same key has different request content", 409)
+        if fence is not None:
+            await fence.refresh()
+            self._accepting()
+            with self.store.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    "SELECT * FROM requests WHERE run_id=?", (existing["run_id"],)
+                ).fetchone()
+                if current is None:
+                    raise AgentError("not_found", "admitted request is unavailable", 404)
+                checked_admission_metadata(fence.replay, db, dict(current))
         return await self.view(existing["owner"], existing["run_id"])
 
     async def submit(
@@ -468,6 +503,8 @@ class RunEngine:
         key: str,
         value: JsonValue,
         options: RunOptions | None = None,
+        *,
+        admission_fence: AdmissionFence | None = None,
     ) -> dict:
         options = options or RunOptions()
         TypeAdapter(Identifier).validate_python(key)
@@ -481,7 +518,7 @@ class RunEngine:
         # 决定 idempotency 的是原始客户端输入，而非由版本推导出的 payload。
         existing = self.store.lookup(identity.owner, agent_id, key)
         if existing:
-            return await self._idempotent_view(existing, value, options)
+            return await self._idempotent_view(existing, value, options, admission_fence)
         bound = self.registry.agent(agent_id)
         current_identity = await self.identity(identity.owner)
         if current_identity != identity:
@@ -498,7 +535,7 @@ class RunEngine:
                 # 队列/容量检查绝不阻塞已有的幂等请求。
                 existing = self.store.lookup(identity.owner, agent_id, key)
                 if existing:
-                    return await self._idempotent_view(existing, value, options)
+                    return await self._idempotent_view(existing, value, options, admission_fence)
                 # 前一次准入可能仍在准备同一个 key。只有真正的新请求才会按所选
                 # 发布版本解释。
                 SchemaContract(bound.definition.input_schema).validate(value, code="agent_input")
@@ -525,6 +562,8 @@ class RunEngine:
                         raise AgentError(
                             "permission_changed", "identity changed during Agent authorization", 403
                         )
+                if admission_fence is not None:
+                    await admission_fence.refresh()
                 if not isinstance(payload, dict):
                     raise AgentError(
                         "admission_contract", "prepared payload must be a JSON object", 503
@@ -537,6 +576,19 @@ class RunEngine:
                     admission_commit = self.task_coordinator.root_commit(
                         bound, identity, deadline, admission_commit
                     )
+                if admission_fence is not None:
+                    fence = admission_fence
+                    original_commit = admission_commit
+
+                    def fenced_commit(db, request):
+                        if original_commit is not None:
+                            checked_admission_metadata(original_commit, db, request)
+                        checked_admission_metadata(fence.commit, db, request)
+
+                    admission_commit = fenced_commit
+                # Preparation/authorization may have yielded while shutdown started.
+                # Fence before any request, epoch switch or task-tree rows are committed.
+                self._accepting()
                 row, created, victims = self.store.admit(
                     identity,
                     agent_id,
@@ -548,20 +600,14 @@ class RunEngine:
                     deadline,
                     "fixed-deadline" if managed else binding.execution_policy,
                     admission_commit=admission_commit,
+                    admission_replay=admission_fence.replay
+                    if admission_fence is not None
+                    else None,
                 )
                 if created:
                     self._observe("run.accepted", row, {})
                 for victim in victims:
-                    self.pending.discard(victim)
-                    if victim in self.active:
-                        self.cancel_once(self.active[victim])
-                    else:
-                        victim_row = self.store.internal_request(victim)
-                        await self.terminal_checkpoint(
-                            victim_row,
-                            self._cancel_status(victim_row),
-                            "user_cancel_or_topic_switch",
-                        )
+                    self._request_cancel(self.store.internal_request(victim))
                 if not managed:
                     await self.update_checkpoint(row, binding.initial(row), as_node=START)
                 self.store.append_event(row, "run.accepted", {"epoch": row["epoch"]})
@@ -666,6 +712,14 @@ class RunEngine:
             run_id = row["run_id"]
             self.pending.discard(run_id)
             try:
+                stopping = self._cancellations.get(run_id)
+                if stopping is not None:
+                    # A cancelled queued run has one checkpoint writer. Do not start
+                    # a second execution while its cancellation owns finalization.
+                    await asyncio.shield(stopping)
+                    self.queue.task_done()
+                    self.task_coordinator.wake.set()
+                    continue
                 if isinstance(command, TaskTicket) and not self.task_coordinator.claim(
                     row, command
                 ):
@@ -871,6 +925,17 @@ class RunEngine:
                 "waiting_children": "waiting_children",
                 "awaiting_review": "awaiting_review",
             }[dispatch["state"]]
+        cleanup_pending = bool(row["cancel"]) and (
+            run_id in self._cancellations
+            and not self._cancellations[run_id].done()
+            or any(
+                (task := self.active.get(record["run_id"])) is not None and not task.done()
+                for record in self._descendant_rows(row)
+            )
+        )
+        if cleanup_pending and receipt is None:
+            status = "cancelling"
+            interrupts = []
         if receipt is not None:
             status = (
                 "needs_reconciliation"
@@ -919,6 +984,8 @@ class RunEngine:
             "conversation_id": self._control(row)["conversation_id"],
             "epoch": row["epoch"],
             "status": status,
+            "cancel_requested": bool(row["cancel"]),
+            "cleanup_pending": cleanup_pending,
             "deadline": row["deadline"],
             "recoverable": status
             in {
@@ -1020,41 +1087,72 @@ class RunEngine:
         ] + (policy(row) if policy else [])
 
     async def cancel(self, owner: str, run_id: str, *, _timeout=False) -> dict:
+        # This synchronous transaction/map update cannot interleave with another
+        # event-loop task. Existing-run fencing must not wait for admission prepare.
         row = self.store.request(owner, run_id)
-        if self.task_coordinator.metadata(run_id) is not None:
-            outcome = self.task_coordinator.outcome(run_id)
-            if outcome is not None:
-                return await self.view(owner, run_id)
-            await self._stop_task_tree(row, include_self=True)
-            status = self._cancel_status(row)
-            if _timeout and status == "cancelled":
-                status = "timed_out"
-            if self.store.final_receipt(owner, run_id) is None:
-                await self.terminal_checkpoint(
-                    row,
-                    status,
-                    "original_deadline_expired" if _timeout else "user_cancel_or_topic_switch",
-                )
-            return await self.view(owner, run_id)
-        async with self.admission_lock:
-            if not self.store.cancel(owner, run_id):
-                return await self.view(owner, run_id)
-            self.pending.discard(run_id)
-            task = self.active.get(run_id)
-            if task:
-                self.cancel_once(task)
-                await asyncio.gather(task, return_exceptions=True)
-            else:
-                await self.terminal_checkpoint(
-                    row,
-                    self._cancel_status(row),
-                    "user_cancel_or_topic_switch",
-                )
+        cleanup = self._request_cancel(row, timeout=_timeout)
+        # asyncio.wait neither cancels the owned finalizer at the deadline nor
+        # propagates a disconnected caller's cancellation into tool cleanup.
+        if cleanup is not None:
+            await asyncio.wait({cleanup}, timeout=self.settings.cancel_wait_seconds)
+            if cleanup.done():
+                cleanup.result()
         if not self.available:
             raise AgentError(
                 "cancel_cleanup_failed", "cancel recorded; state storage needs repair", 503
             )
         return await self.view(owner, run_id)
+
+    def _request_cancel(self, row, *, timeout=False):
+        """No await: durable fencing and ownership precede any slow finalization."""
+        run_id = row["run_id"]
+        if (cleanup := self._cancellations.get(run_id)) is not None:
+            return cleanup
+        if self.closing:
+            raise AgentError("not_accepting", "runtime is shutting down", 503)
+        managed = self.task_coordinator.metadata(run_id) is not None
+        if managed:
+            if self.task_coordinator.outcome(run_id) is not None:
+                return None
+            self._request_task_tree_stop(row, include_self=True)
+        else:
+            if not self.store.cancel(row["owner"], run_id):
+                return None  # A final SQL receipt won the race.
+            self.pending.discard(run_id)
+            if (task := self.active.get(run_id)) is not None:
+                self.cancel_once(task)
+        cleanup = asyncio.create_task(self._finish_cancel(row, managed, timeout))
+        self._cancellations[run_id] = cleanup
+        cleanup.add_done_callback(lambda done: self._cancel_finished(run_id, done))
+        return cleanup
+
+    def _cancel_finished(self, run_id, task):
+        if self._cancellations.get(run_id) is task:
+            self._cancellations.pop(run_id)
+        # Observe background errors even if every caller disconnected.
+        if not task.cancelled():
+            task.exception()
+
+    async def _finish_cancel(self, row, managed, is_timeout):
+        try:
+            if managed:
+                await self._stop_task_tree(row, include_self=True)
+            elif (task := self.active.get(row["run_id"])) is not None:
+                await asyncio.gather(task, return_exceptions=True)
+            if self.store.final_receipt(row["owner"], row["run_id"]) is None:
+                status = self._cancel_status(row)
+                if is_timeout and status == "cancelled":
+                    status = "timed_out"
+                await self.terminal_checkpoint(
+                    row,
+                    status,
+                    "original_deadline_expired" if is_timeout else "user_cancel_or_topic_switch",
+                )
+        except Exception as exc:
+            self.available = False
+            raise AgentError(
+                "cancel_cleanup_failed", "cancel recorded; state storage needs repair", 503
+            ) from exc
 
     def _uncertain(self, row):
         descendants = self._descendant_rows(row)
@@ -1083,7 +1181,7 @@ class RunEngine:
                 )
             ]
 
-    async def _stop_task_tree(self, row, *, include_self=False):
+    def _request_task_tree_stop(self, row, *, include_self=False):
         with self.store.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             task_tree.ancestry_in(db, row["run_id"])
@@ -1108,6 +1206,10 @@ class RunEngine:
         ]
         for task in tasks:
             self.cancel_once(task)
+        return records, tasks
+
+    async def _stop_task_tree(self, row, *, include_self=False):
+        records, tasks = self._request_task_tree_stop(row, include_self=include_self)
         await asyncio.gather(*tasks, return_exceptions=True)
         for record in records:
             if (

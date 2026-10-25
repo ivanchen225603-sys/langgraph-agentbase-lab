@@ -4,11 +4,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, JsonValue, model_validator
 
 from .contracts import AgentError, BaseContract, Identifier, Identity
+from .intent_execution import SyntheticIntentExecutor
+from .intent_proposals import IntentProposalService
 from .runtime import RunEngine
 from .runtime_contracts import RunOptions
 from .sse import (
@@ -119,6 +121,8 @@ def mount_agent_routes(
     refresh_identity: RequestAuthenticator,
     authorize_agent: AgentAccess | None = None,
     limits: AgentHttpLimits | None = None,
+    intent_service_getter: Callable[[], IntentProposalService] | None = None,
+    intent_execution_getter: Callable[[], SyntheticIntentExecutor] | None = None,
 ):
     """只挂载一次，需在启动之前、其他用户中间件之后执行。
 
@@ -176,6 +180,49 @@ def mount_agent_routes(
         if await engine_getter().identity(identity.owner) != identity:
             raise AgentError("identity", "current server identity changed", 403)
         return {"agents": result}
+
+    @app.get("/api/v1/agents/{agent_id}/runs")
+    async def run_index(
+        request: Request,
+        agent_id: Identifier,
+        identity: Annotated[Identity, Depends(actor)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+        after: Identifier | None = None,
+    ):
+        if set(request.query_params) - {"limit", "after"} or any(
+            len(request.query_params.getlist(key)) != 1 for key in request.query_params
+        ):
+            raise AgentError("run_list_query", "unknown or repeated Run index parameter")
+        engine = engine_getter()
+
+        async def current():
+            refreshed = await refresh_identity(request)
+            if (
+                not isinstance(refreshed, Identity)
+                or refreshed != identity
+                or await engine.identity(identity.owner) != identity
+            ):
+                raise AgentError(
+                    "permission_changed", "original credential or identity changed", 403
+                )
+            if not await engine.agent_allowed(identity, agent_id):
+                raise AgentError("agent_forbidden", "Agent access is not authorized", 403)
+            if await engine.identity(identity.owner) != identity:
+                raise AgentError("permission_changed", "current server identity changed", 403)
+
+        await current()
+        engine.registry.agent(agent_id)
+        identifiers, next_after = engine.store.list_run_ids(
+            identity.owner, agent_id, after=after, limit=limit
+        )
+        await current()
+        return JSONResponse(
+            {
+                "runs": [{"run_id": run_id, "agent_id": agent_id} for run_id in identifiers],
+                "next_after": next_after,
+            },
+            headers={"Cache-Control": "no-store", "Vary": "Authorization, Cookie"},
+        )
 
     @app.post("/api/v1/agents/{agent_id}/runs", status_code=202)
     async def submit(
@@ -264,3 +311,14 @@ def mount_agent_routes(
     # 最后注册者在用户中间件中位于最外层：即便内层 BaseHTTPMiddleware 预先取走了
     # body 帧，它仍能看到真实的服务端 send。
     app.add_middleware(EventSendBounds)
+    if intent_service_getter is not None:
+        from .intent_http import mount_intent_routes
+
+        mount_intent_routes(
+            app,
+            engine_getter,
+            intent_service_getter,
+            actor,
+            refresh_identity,
+            execution_getter=intent_execution_getter,
+        )

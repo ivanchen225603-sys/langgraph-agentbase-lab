@@ -9,10 +9,27 @@ from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any
 
-from .contracts import AgentError, MemoryRecord, Message
+from pydantic import Field
+
+from .contracts import AgentError, BaseContract, Identity, MemoryRecord, Message
+from .memory_audit import (
+    MemoryAuditRecord,
+    install_memory_audit,
+    read_memory_audit,
+    record_memory_change,
+)
 from .schema import canonical_json
 
 ConnectionFactory = Callable[[], AbstractContextManager[sqlite3.Connection]]
+
+
+class MemoryLimits(BaseContract):
+    """Opt-in retained payload limits; disabled and expired records still consume storage."""
+
+    max_namespace_records: int = Field(1000, ge=1)
+    max_namespace_bytes: int = Field(8388608, ge=1)
+    max_owner_records: int = Field(10000, ge=1)
+    max_owner_bytes: int = Field(67108864, ge=1)
 
 
 class SqliteDatabase:
@@ -42,8 +59,39 @@ class SqliteContextStore:
     事务中执行，绝不能从本构造函数里触发。
     """
 
-    def __init__(self, connection: ConnectionFactory):
+    def __init__(self, connection: ConnectionFactory, *, memory_limits: MemoryLimits | None = None):
         self.connection = connection
+        self.memory_limits = memory_limits
+
+    def _memory_capacity(
+        self, db, record: MemoryRecord, payload: str, previous_bytes: int = 0, *, maintenance=False
+    ):
+        limits = self.memory_limits
+        if limits is None:
+            return
+        if db.execute("PRAGMA encoding").fetchone()[0] != "UTF-8":
+            raise AgentError("memory_encoding", "memory limits require a UTF-8 database", 503)
+        incoming = len(payload.encode("utf-8"))
+        for where, parameters, count_limit, byte_limit in (
+            (
+                "owner=? AND agent_id=? AND conversation_id=?",
+                (record.owner, record.agent_id, record.conversation_id),
+                limits.max_namespace_records,
+                limits.max_namespace_bytes,
+            ),
+            ("owner=?", (record.owner,), limits.max_owner_records, limits.max_owner_bytes),
+        ):
+            count, size = db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(length(CAST(payload AS BLOB))),0) "
+                "FROM agent_memories WHERE " + where,
+                parameters,
+            ).fetchone()
+            if (previous_bytes == 0 and count + 1 > count_limit) or (
+                size - previous_bytes + incoming > byte_limit
+                and incoming > previous_bytes
+                and not maintenance
+            ):
+                raise AgentError("memory_quota", "retained memory storage limit exceeded", 409)
 
     @staticmethod
     def install(db: sqlite3.Connection):
@@ -52,8 +100,12 @@ class SqliteContextStore:
         ).fetchone()
         if exists:
             row = db.execute("SELECT value FROM agent_context_meta WHERE key='schema'").fetchone()
-            if not row or row[0] != "1":
+            if not row or row[0] not in {"1", "2"}:
                 raise AgentError("context_schema", "context schema requires a supported migration")
+        if not db.in_transaction:
+            # Legacy installers may rely on the connection context to commit.
+            # Start their migration atomically without taking over commit/rollback.
+            db.execute("BEGIN IMMEDIATE")
         statements = (
             "CREATE TABLE IF NOT EXISTS agent_context_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
             "INSERT OR IGNORE INTO agent_context_meta VALUES('schema','1')",
@@ -63,6 +115,8 @@ class SqliteContextStore:
         )
         for statement in statements:
             db.execute(statement)
+        install_memory_audit(db)
+        db.execute("UPDATE agent_context_meta SET value='2' WHERE key='schema'")
 
     @staticmethod
     def _epoch(db, owner, agent_id, conversation_id) -> int:
@@ -139,6 +193,7 @@ class SqliteContextStore:
         importance: float = 0.5,
         valid_until: float | None = None,
         sources: list[dict] | None = None,
+        actor: Identity | None = None,
     ) -> MemoryRecord:
         now = time.time()
         record = MemoryRecord(
@@ -155,10 +210,13 @@ class SqliteContextStore:
         )
         payload = canonical_json(record.model_dump(mode="json")).decode()
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._memory_capacity(db, record, payload)
             db.execute(
                 "INSERT INTO agent_memories VALUES(?,?,?,?,?,?,?,?,?)",
                 (owner, agent_id, conversation_id, record.id, payload, 1, 1, valid_until, now),
             )
+            record_memory_change(db, None, record, actor)
         return record
 
     def memory(self, owner: str, agent_id: str, conversation_id: str, memory_id: str):
@@ -189,6 +247,7 @@ class SqliteContextStore:
         *,
         content: str | None = None,
         enabled: bool | None = None,
+        actor: Identity | None = None,
     ) -> MemoryRecord:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -209,6 +268,16 @@ class SqliteContextStore:
                 values["enabled"] = enabled
             record = MemoryRecord.model_validate(values)
             payload = canonical_json(record.model_dump(mode="json")).decode()
+            # Capacity must not prevent disabling or shrinking. Version/time and
+            # enabled=false can add a few bookkeeping bytes; charge them afterwards.
+            old_content_bytes = len(canonical_json(previous.content))
+            new_content_bytes = len(canonical_json(record.content))
+            maintenance = new_content_bytes <= old_content_bytes and (
+                enabled is False or new_content_bytes < old_content_bytes
+            )
+            self._memory_capacity(
+                db, record, payload, len(row[0].encode("utf-8")), maintenance=maintenance
+            )
             db.execute(
                 "UPDATE agent_memories SET payload=?,version=?,enabled=?,updated_at=? WHERE owner=? AND agent_id=? AND conversation_id=? AND id=? AND version=?",
                 (
@@ -223,13 +292,54 @@ class SqliteContextStore:
                     expected_version,
                 ),
             )
+            record_memory_change(db, previous, record, actor)
             return record
 
-    def delete_memory(self, owner: str, agent_id: str, conversation_id: str, memory_id: str):
+    def delete_memory(
+        self,
+        owner: str,
+        agent_id: str,
+        conversation_id: str,
+        memory_id: str,
+        *,
+        actor: Identity | None = None,
+    ):
         with self.connection() as db:
-            cursor = db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload FROM agent_memories WHERE owner=? AND agent_id=? AND conversation_id=? AND id=?",
+                (owner, agent_id, conversation_id, memory_id),
+            ).fetchone()
+            if row is None:
+                raise AgentError("memory_not_found", "memory is not available", 404)
+            previous = MemoryRecord.model_validate_json(row[0])
+            db.execute(
                 "DELETE FROM agent_memories WHERE owner=? AND agent_id=? AND conversation_id=? AND id=?",
                 (owner, agent_id, conversation_id, memory_id),
             )
-            if not cursor.rowcount:
-                raise AgentError("memory_not_found", "memory is not available", 404)
+            record_memory_change(db, previous, None, actor)
+
+    def memory_audit(
+        self,
+        identity: Identity,
+        agent_id: str,
+        conversation_id: str,
+        memory_id: str,
+        *,
+        guard: Callable[[sqlite3.Connection], bool],
+        after: int = 0,
+        limit: int = 100,
+    ) -> list[MemoryAuditRecord]:
+        """No HTTP endpoint: the trusted host supplies fresh audit-read authorization."""
+        with self.connection() as db:
+            db.execute("BEGIN")
+            return read_memory_audit(
+                db,
+                identity,
+                agent_id,
+                conversation_id,
+                memory_id,
+                guard=guard,
+                after=after,
+                limit=limit,
+            )

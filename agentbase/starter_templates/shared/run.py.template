@@ -1,0 +1,121 @@
+"""Standalone starter; run with the installed rag-langgraph-lab distribution."""
+
+import argparse
+import asyncio
+import json
+import uuid
+from pathlib import Path
+
+import agent
+
+from agentbase import open_runtime
+from agentbase.contracts import Identity, ModelChunk, ModelResponse, ToolCallDelta
+from agentbase.evaluation import diagnose_run, evaluate_cases, load_cases, wait_for_outcome
+from agentbase.providers import Utf8BudgetEstimator, openai_factory
+
+
+class OfflineProvider:
+    """Deterministic fixture for engineering flows, not model quality evidence."""
+
+    native_stream = True
+
+    async def complete(self, request) -> ModelResponse:
+        return await agent.offline_response(request)
+
+    async def stream(self, request):
+        response = await self.complete(request)
+        if response.text:
+            yield ModelChunk(text_delta=response.text)
+        for index, call in enumerate(response.tool_calls):
+            yield ModelChunk(
+                tool_call_deltas=[
+                    ToolCallDelta(
+                        index=index,
+                        call_id=call.call_id,
+                        name=call.name,
+                        arguments_delta=json.dumps(call.arguments, ensure_ascii=False),
+                    )
+                ]
+            )
+        yield ModelChunk(finish_reason="tool_calls" if response.tool_calls else "stop")
+
+    count_input_tokens = staticmethod(Utf8BudgetEstimator.input_tokens)
+    count_output_tokens = staticmethod(Utf8BudgetEstimator.output_tokens)
+
+
+async def run(args):
+    if args.mode == "openai" and not hasattr(agent, "offline_response"):
+        raise ValueError("this fixed-action template does not use a model")
+    if args.mode == "openai" and not args.model:
+        raise ValueError("--model is required for explicit paid-model mode")
+    provider_factory = (
+        openai_factory if args.mode == "openai" else lambda configuration: OfflineProvider()
+    )
+    registry = agent.create_registry(
+        provider_factory, args.model or "offline-fixture", args.data_dir
+    )
+    identity = Identity(owner="starter-user", scopes=frozenset(agent.SCOPES))
+
+    async def resolve(owner):
+        return identity if owner == identity.owner else None
+
+    async with open_runtime(registry, data_dir=args.data_dir, identity_resolver=resolve) as engine:
+        if hasattr(agent, "initialize"):
+            agent.initialize(engine)
+
+        async def wait(run_id):
+            row = engine.store.request(identity.owner, run_id)
+            bound = registry.resolve(row["agent_id"], row["binding"])
+            return await wait_for_outcome(
+                engine,
+                identity.owner,
+                run_id,
+                timeout_seconds=bound.definition.budget.timeout_seconds + 1,
+            )
+
+        if args.cases:
+            return await evaluate_cases(
+                engine,
+                identity,
+                agent.AGENT_ID,
+                load_cases(args.cases),
+                mode="model" if args.mode == "openai" else "offline",
+            )
+        if args.diagnose:
+            return await diagnose_run(engine, identity.owner, args.diagnose)
+        if args.resume:
+            if not args.review_id or not args.digest:
+                raise ValueError(
+                    "resume requires the exact --review-id and --digest displayed to you"
+                )
+            await engine.resume(identity, args.resume, review_id=args.review_id, digest=args.digest)
+            return await wait(args.resume)
+        payload = json.loads(args.input.read_text(encoding="utf-8"))
+        created = await engine.submit(
+            identity, agent.AGENT_ID, args.request_key or uuid.uuid4().hex, payload
+        )
+        return await wait(created["run_id"])
+
+
+def main():
+    root = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("offline", "openai"), default="offline")
+    parser.add_argument("--model")
+    parser.add_argument("--data-dir", type=Path, default=root / ".runtime")
+    parser.add_argument("--input", type=Path, default=root / "sample.json")
+    parser.add_argument("--cases", type=Path)
+    parser.add_argument("--request-key")
+    parser.add_argument("--diagnose")
+    parser.add_argument("--resume")
+    parser.add_argument("--review-id")
+    parser.add_argument("--digest")
+    args = parser.parse_args()
+    result = asyncio.run(run(args))
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.cases and result["failed"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

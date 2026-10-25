@@ -4,6 +4,9 @@ from collections import OrderedDict
 
 from .errors import LabError, TransientError
 
+# This circuit serves retrieval/generation/embedding through guarded(); ToolCircuit
+# serves registered handlers with probe identity and logical-attempt completion.
+
 
 def remaining(deadline: float) -> float:
     value = deadline - time.time()

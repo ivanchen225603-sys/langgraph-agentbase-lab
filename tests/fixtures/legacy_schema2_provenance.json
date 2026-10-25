@@ -1,0 +1,23 @@
+{
+  "source_snapshot": "before-tool-resolver-20261007T081136Z.zip",
+  "source_sha256": "1c6c85417ef133fec5809faba8eca078fcac4553d71171ba6625032939665890",
+  "capture": {
+    "done": "02098748dff34ce585dde8d898b6ec1d",
+    "paused": "fdb47ef9d5b84836a7608b6ad1acbed1",
+    "schema": 2
+  },
+  "stderr": "",
+  "fixtures": {
+    "legacy_schema2.sql": {
+      "bytes": 18274,
+      "sha256": "8e03f04d4bf9cb46654c2bed810f10e306dabdc5702309f31cfafdb43e297bcb"
+    },
+    "legacy_schema2_checkpoints.sql": {
+      "bytes": 87627,
+      "sha256": "c770d26408aebf0a69e69b43d026c109561b1918d5278e58dfc85494e4eea7f9"
+    }
+  },
+  "history_marker_synthetic": true,
+  "actual_process_crash_test": false,
+  "checkpoint_export_included": true
+}

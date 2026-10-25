@@ -1,0 +1,7 @@
+[
+  {"id":"heldout-backup","question":"Zephyr 的备份在哪个时间？","source":"zephyr.md","status":"answered","terms":["03:15"]},
+  {"id":"heldout-negative","question":"Zephyr 是否允许外网传输？","source":"zephyr.md","status":"answered","terms":["禁止"]},
+  {"id":"heldout-expired","question":"OldBeacon 的超时是多少？","source":null,"status":"refused","terms":[]},
+  {"id":"heldout-conflict","question":"DeltaService 的超时是多少？","source":null,"status":"refused","terms":[]},
+  {"id":"heldout-unknown","question":"银河银行的账号密码？","source":null,"status":"refused","terms":[]}
+]

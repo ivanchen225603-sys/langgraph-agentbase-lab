@@ -17,6 +17,12 @@ from starlette.staticfiles import StaticFiles
 
 from agentbase.context import SourceChecker
 from agentbase.http import AgentAccess, BodyLimit, mount_agent_routes
+from agentbase.intent_proposals import (
+    IntentInterpreter,
+    IntentProposalLimits,
+    IntentProposalService,
+    OfflineStructuredIntent,
+)
 from agentbase.registry import ComponentRegistry
 from agentbase.tools import ResultPolicy, ToolAuthorizer
 
@@ -35,6 +41,8 @@ from .models import (
 from .observability import logger
 from .runtime_adapter import identity as agent_identity
 from .service import LabService
+
+_OFFLINE_INTENTS = OfflineStructuredIntent()
 
 
 class CompareInput(StrictModel):
@@ -56,6 +64,8 @@ def create_app(
     authorize_agent: AgentAccess | None = None,
     result_policy: ResultPolicy | None = None,
     tool_authorizer: ToolAuthorizer | None = None,
+    intent_interpreter: IntentInterpreter | None = _OFFLINE_INTENTS,
+    intent_limits: IntentProposalLimits | None = None,
 ):
     settings = settings or Settings()
     service = LabService(
@@ -68,13 +78,24 @@ def create_app(
         agent_authorizer=authorize_agent,
     )
 
+    intents: IntentProposalService | None = None
+
     @asynccontextmanager
     async def lifespan(app):
+        nonlocal intents
         await service.start()
         app.state.service = service
         try:
+            if intent_interpreter is not None:
+                intents = IntentProposalService(
+                    service.runtime, intent_interpreter, limits=intent_limits
+                )
+                intents.install()
+                app.state.intents = intents
             yield
         finally:
+            intents = None
+            app.state.intents = None
             await service.close()
 
     app = FastAPI(title="RAG LangGraph Memory Lab", version="0.1.0", lifespan=lifespan)
@@ -344,6 +365,14 @@ def create_app(
 
     web = Path(__file__).parent / "web"
 
+    @app.get("/static/intent-ui.mjs", include_in_schema=False)
+    async def intent_module():
+        return FileResponse(web / "intent-ui.mjs", media_type="application/javascript")
+
+    @app.get("/static/cancel-status.mjs", include_in_schema=False)
+    async def cancellation_module():
+        return FileResponse(web / "cancel-status.mjs", media_type="application/javascript")
+
     @app.get("/static/sse.mjs", include_in_schema=False)
     async def sse_module():
         # Windows 的 MIME 注册表条目可能把 .mjs 映射为 text/plain，
@@ -362,6 +391,13 @@ def create_app(
     async def refresh_actor(request: Request):
         return agent_identity(await authenticate(request))
 
+    def current_intents():
+        if intents is None:
+            from agentbase.contracts import AgentError
+
+            raise AgentError("not_accepting", "intent service is not started", 503)
+        return intents
+
     mount_agent_routes(
         app,
         lambda: service.runtime,
@@ -369,5 +405,6 @@ def create_app(
         refresh_identity=refresh_actor,
         authorize_agent=authorize_agent,
         limits=settings.agent_http,
+        intent_service_getter=current_intents if intent_interpreter is not None else None,
     )
     return app

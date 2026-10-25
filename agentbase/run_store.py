@@ -8,10 +8,12 @@ import time
 import uuid
 from collections.abc import Callable
 
+from pydantic import TypeAdapter, ValidationError
+
 from . import planning, task_tree
 from .artifacts import SqliteArtifactStore
 from .budgets import SqliteBudgetLedger
-from .contracts import AgentError, Identity, RunContext, RunEvent
+from .contracts import AgentError, Identifier, Identity, RunContext, RunEvent
 from .effects import SqliteActionLedger
 from .runtime_contracts import EngineSettings, FinalProjection, RunOptions
 from .schema import canonical_json, content_digest
@@ -119,6 +121,25 @@ class SqliteRunStore:
             raise AgentError("not_found", "run not found", 404)
         return dict(row)
 
+    def list_run_ids(
+        self, owner: str, agent_id: str, *, after: str | None = None, limit: int = 20
+    ) -> tuple[list[str], str | None]:
+        """Bounded identity-scoped discovery; never load payloads or reconcile effects."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise AgentError("run_list_query", "limit must be an integer from 1 to 50")
+        if after is not None:
+            try:
+                TypeAdapter(Identifier).validate_python(after, strict=True)
+            except ValidationError as exc:
+                raise AgentError("run_list_query", "invalid Run index boundary") from exc
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT run_id FROM requests WHERE owner=? AND agent_id=? AND run_id>? ORDER BY run_id LIMIT ?",
+                (owner, agent_id, after or "", limit + 1),
+            ).fetchall()
+        identifiers = [row["run_id"] for row in rows[:limit]]
+        return identifiers, identifiers[-1] if len(rows) > limit else None
+
     def internal_request(self, run_id: str) -> dict:
         with self.connection() as db:
             row = db.execute("SELECT * FROM requests WHERE run_id=?", (run_id,)).fetchone()
@@ -156,6 +177,7 @@ class SqliteRunStore:
         execution_policy: str,
         *,
         admission_commit: Callable[[sqlite3.Connection, dict], None] | None = None,
+        admission_replay: Callable[[sqlite3.Connection, dict], None] | None = None,
     ):
         if not db.in_transaction:
             raise AgentError("admission_contract", "request admission requires a transaction", 503)
@@ -175,6 +197,10 @@ class SqliteRunStore:
                 raise AgentError(
                     "idempotency_conflict", "same key has different request content", 409
                 )
+            if admission_replay is not None:
+                from .runtime_contracts import checked_admission_metadata
+
+                checked_admission_metadata(admission_replay, db, dict(old))
             return dict(old), False, []
         if db.execute("SELECT COUNT(*) FROM requests").fetchone()[0] >= self.settings.max_runs:
             raise AgentError(
@@ -230,17 +256,9 @@ class SqliteRunStore:
         )
         row = dict(db.execute("SELECT * FROM requests WHERE run_id=?", (run_id,)).fetchone())
         if admission_commit is not None:
-            returned = admission_commit(db, copy.deepcopy(row))
-            if inspect.isawaitable(returned):
-                if inspect.iscoroutine(returned):
-                    returned.close()
-                raise AgentError(
-                    "admission_contract", "admission metadata commit must be synchronous", 503
-                )
-            if returned is not None:
-                raise AgentError(
-                    "admission_contract", "admission metadata commit must return None", 503
-                )
+            from .runtime_contracts import checked_admission_metadata
+
+            checked_admission_metadata(admission_commit, db, copy.deepcopy(row))
         return row, True, victims
 
     def cancel(self, owner: str, run_id: str) -> bool:

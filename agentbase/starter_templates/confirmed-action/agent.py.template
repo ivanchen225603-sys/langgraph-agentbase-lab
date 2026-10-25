@@ -1,0 +1,151 @@
+"""Exact-confirmation local note example, with durable business idempotency and receipts."""
+
+import json
+import time
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from agentbase import ActionReceipt, AgentPackage, build_registry, function_tool
+from agentbase.contracts import AgentError, RunContext
+from agentbase.fixed_workflow import fixed_factory
+from agentbase.schema import canonical_json
+from agentbase.storage import SqliteDatabase
+
+AGENT_ID = "confirmed-note"
+SCOPES = ("notes.write",)
+
+
+class Input(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    business_key: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=1000)
+
+
+class Receipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    business_key: str
+    text: str
+    saved: bool
+
+
+def initialize(engine):
+    with engine.store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS starter_notes(owner TEXT,business_key TEXT,text TEXT,PRIMARY KEY(owner,business_key))"
+        )
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS starter_note_receipts(operation_key TEXT PRIMARY KEY,owner TEXT,agent_id TEXT,run_id TEXT,binding TEXT,fingerprint TEXT,attempt_token TEXT,value TEXT)"
+        )
+
+
+def inspect_receipt(db, operation):
+    row = db.execute(
+        "SELECT * FROM starter_note_receipts WHERE operation_key=?", (operation["key"],)
+    ).fetchone()
+    if row is None:
+        return None
+    if any(
+        row[key] != operation[key]
+        for key in ("owner", "agent_id", "run_id", "binding", "fingerprint", "attempt_token")
+    ):
+        raise AgentError("note_receipt", "note receipt differs from claimed operation", 409)
+    value = json.loads(row["value"])
+    # This template always returns a Receipt object on success. JSON null is a
+    # durable rejection, committed without touching the note in the same transaction.
+    return (
+        ActionReceipt(phase="not_applied")
+        if value is None
+        else ActionReceipt(phase="applied", value=value)
+    )
+
+
+def create_registry(provider_factory, model, data_dir):
+    database = SqliteDatabase(data_dir / "runs.sqlite")
+
+    async def save_note(business_key: str, text: str, context: RunContext) -> Receipt:
+        """Persist a local note only after exact action confirmation."""
+        with database.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            operation = db.execute(
+                "SELECT * FROM agent_tool_operations WHERE key=?", (context.operation_key,)
+            ).fetchone()
+            request = db.execute(
+                "SELECT cancel FROM requests WHERE run_id=?", (context.run_id,)
+            ).fetchone()
+            if (
+                operation is None
+                or operation["attempt_token"] != context.attempt_token
+                or operation["phase"] != "intent"
+                or request is None
+                or request["cancel"]
+                or time.time() >= min(context.deadline, operation["call_deadline"])
+            ):
+                raise AgentError("note_attempt", "note attempt is no longer current", 409)
+            previous = db.execute(
+                "SELECT text FROM starter_notes WHERE owner=? AND business_key=?",
+                (context.identity.owner, business_key),
+            ).fetchone()
+            conflict = previous is not None and previous["text"] != text
+            if not conflict:
+                db.execute(
+                    "INSERT OR IGNORE INTO starter_notes VALUES(?,?,?)",
+                    (context.identity.owner, business_key, text),
+                )
+            value = None if conflict else Receipt(business_key=business_key, text=text, saved=True)
+            db.execute(
+                "INSERT INTO starter_note_receipts VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    context.operation_key,
+                    context.identity.owner,
+                    context.agent_id,
+                    context.run_id,
+                    context.config_digest,
+                    operation["fingerprint"],
+                    context.attempt_token,
+                    canonical_json(
+                        value.model_dump(mode="json") if value is not None else None
+                    ).decode(),
+                ),
+            )
+        if value is None:
+            raise AgentError("note_conflict", "business key already has different content", 409)
+        return value
+
+    tool = function_tool(
+        save_note,
+        name="notes.save",
+        scope="notes.write",
+        read_only=False,
+        idempotency="business-key",
+        context_parameter="context",
+    )
+
+    def workflow(engine, saver, bound):
+        binding = fixed_factory(engine, saver, bound)
+        binding.receipt_inspector = inspect_receipt
+        return binding
+
+    package = AgentPackage.model_validate(
+        {
+            "tools": [tool.declaration.model_dump(mode="json")],
+            "agents": [
+                {
+                    "id": AGENT_ID,
+                    "description": "Save a local note after exact approval",
+                    "workflow": "starter.confirmed",
+                    "input_schema": Input.model_json_schema(),
+                    "prompt": {"system_template": "Execute the declared note task after approval."},
+                    "tools": [tool.declaration.name],
+                    "tasks": [
+                        {
+                            "id": "save",
+                            "tool": tool.declaration.name,
+                            "input_bindings": {"business_key": "/business_key", "text": "/text"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    return build_registry(package, tools=[tool], workflows={"starter.confirmed": workflow})

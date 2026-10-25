@@ -1,0 +1,44 @@
+Professional Agent starter
+
+Install rag-langgraph-lab into your Python environment first. No source-checkout
+path or raglab service is needed. In this generated directory:
+
+  python run.py
+  python run.py --cases cases.jsonl
+  python run.py --diagnose RUN_ID
+
+Offline is a deterministic engineering fixture. It does not prove semantic model
+quality, citation support, writing fidelity or general task completion.
+For extraction/research only, explicitly opt into a paid model:
+
+  Set OPENAI_API_KEY outside files, then:
+  python run.py --mode openai --model YOUR_MODEL --cases cases.jsonl
+
+The confirmed-action template uses a fixed workflow and needs no model. It saves
+a local note only after exact approval. Inspect the displayed input/tool preview,
+then provide the displayed run/review/digest explicitly:
+
+  python run.py --resume RUN_ID --review-id REVIEW_ID --digest sha256:...
+
+A business key reuses an identical note across Runs. Different content for the
+same owner/key is rejected without changing the original note. Its bound receipt
+stores JSON null as a durable not_applied fact; an absent receipt remains unknown.
+Receipts are verified against owner, Agent, Run, binding, fingerprint and attempt.
+
+The evaluator never approves. Expected awaiting_review cases are cancelled after
+measurement and do not count as completed actions. Use a normal run to approve.
+
+Edit agent.py for business schemas, instructions and tools. Extend cases.jsonl
+with representative correct/incorrect/permission cases, then a held-out real-model
+set. Source authorization and full domain quality require business implementation.
+The research catalog is a tiny local fixture, not a production retrieval service.
+SCOPES and the local identity are trusted single-user demonstration policies.
+For a shared service, use create_agent_app with actual authentication and fresh
+credential checks. Do not deploy this local identity resolver as public auth.
+
+Runtime databases live in .runtime by default. Use a dedicated --data-dir. Preserve
+matching Agent/component versions for recovery; request-key retries must reuse
+identical input. Never commit .runtime, environment files or credentials.
+Normal runs and exact approval resumes wait for the original Agent binding's
+execution budget plus a one-second completion margin. Evaluation uses each case's
+explicit timeout instead. An abnormal CLI exit closes its local runtime.

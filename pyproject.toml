@@ -24,6 +24,7 @@ include = ["raglab*", "agentbase*"]
 
 [tool.setuptools.package-data]
 raglab = ["web/*"]
+agentbase = ["starter_templates/*/*", "starter_templates/shared/.gitignore.template"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

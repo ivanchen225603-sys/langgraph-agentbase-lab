@@ -4,3 +4,7 @@
 *.jpeg -text
 *.gif -text
 *.ico -text
+
+# Captured synthetic SQL fixtures preserve their recorded provenance bytes.
+tests/fixtures/legacy_schema2.sql -text whitespace=cr-at-eol
+tests/fixtures/legacy_schema2_checkpoints.sql -text whitespace=cr-at-eol

@@ -1,5 +1,6 @@
 """Graph 工厂只提供策略；共享引擎独占所有 Run 生命周期。"""
 
+import inspect
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -7,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import Field, JsonValue
 
-from .contracts import BaseContract, Identifier, Identity, Message
+from .contracts import AgentError, BaseContract, Identifier, Identity, Message
 from .effects import ActionReceiptInspector, ReadAttemptRecoveryInspector
 
 TERMINAL = frozenset(
@@ -35,6 +36,7 @@ class EngineSettings(BaseContract):
     queue_size: int = Field(8, ge=1, le=1024)
     max_runs: int = Field(1000, ge=1, le=100000)
     tools_concurrency: int = Field(4, ge=1, le=64)
+    cancel_wait_seconds: float = Field(1.0, ge=0, le=5)
     event_count: int = Field(512, ge=2, le=10000)
     event_bytes: int = Field(1048576, ge=65536, le=16777216)
     event_seconds: float = Field(86400.0, gt=0, le=2592000)
@@ -62,6 +64,36 @@ class PreparedAdmission:
 
     payload: dict
     commit: Callable[[sqlite3.Connection, dict], None]
+
+
+def checked_admission_metadata(callback, db: sqlite3.Connection, row: dict):
+    """Run only trusted SQL metadata callbacks, never await inside admission."""
+    returned = callback(db, row)
+    if inspect.isawaitable(returned):
+        if inspect.iscoroutine(returned):
+            returned.close()
+        raise AgentError("admission_contract", "admission metadata commit must be synchronous", 503)
+    if returned is not None:
+        raise AgentError("admission_contract", "admission metadata commit must return None", 503)
+
+
+@dataclass(frozen=True)
+class AdmissionFence:
+    """Optional trusted host boundary; never accepted from serialized RunOptions.
+
+    reauthorize runs after admission awaits. commit/replay use the same SQL
+    transaction as new/existing request admission and may not commit or await.
+    """
+
+    reauthorize: Callable[[], Awaitable[object]]
+    commit: Callable[[sqlite3.Connection, dict], None]
+    replay: Callable[[sqlite3.Connection, dict], None]
+
+    async def refresh(self):
+        if await self.reauthorize() is not None:
+            raise AgentError(
+                "admission_contract", "admission reauthorization must return None", 503
+            )
 
 
 @dataclass

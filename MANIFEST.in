@@ -1,8 +1,16 @@
 include requirements.lock Dockerfile compose.yaml .env.example .gitignore .dockerignore .gitattributes
 recursive-include raglab/web *.html *.css *.js *.mjs
+recursive-include agentbase/starter_templates *.template *.json *.jsonl
+include agentbase/starter_templates/shared/.gitignore.template
+prune examples
 include examples/__init__.py examples/agentbase_server.py examples/agentbase.json
 include examples/agentbase_enhancements.py
-include scripts/bootstrap_index.py scripts/backup.py
+include examples/agentbase_minimal.py
+include examples/offline_ticket_receipts.py
+include examples/intent_synthetic_execution.py
+prune scripts
+include scripts/bootstrap_index.py scripts/backup.py scripts/demo.py
+prune data/evaluation
 prune tests
 prune docs
 prune .github

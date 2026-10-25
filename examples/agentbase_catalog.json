@@ -1,0 +1,26 @@
+{
+  "agents": [
+    {
+      "id": "catalog",
+      "version": "1",
+      "description": "External host with an admitted per-run tool catalog",
+      "workflow": "host.catalog",
+      "workflow_version": "1",
+      "prompt": {"system_template": "Use the host's admitted tool catalog."},
+      "input_schema": {
+        "type": "object",
+        "properties": {"text": {"type": "string", "maxLength": 200}},
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "tools": [],
+      "budget": {"max_tool_calls": 1}
+    }
+  ]
+}

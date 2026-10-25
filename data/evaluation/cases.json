@@ -1,0 +1,14 @@
+[
+  {"id":"rag","question":"RAG 为什么要把文档分块？","source":"01-rag.md","status":"answered","terms":["分块","上下文成本"]},
+  {"id":"hybrid","question":"混合检索为何使用 RRF？","source":"01-rag.md","status":"answered","terms":["RRF","异构"]},
+  {"id":"lexical","question":"本地教学模式使用什么模型？","source":"01-rag.md","status":"answered","terms":["词法哈希","不是真实"]},
+  {"id":"memory","question":"长期记忆如何过滤和排序？","source":"02-memory.md","status":"answered","terms":["owner","有效期"]},
+  {"id":"explicit","question":"长期记忆会自动保存每次对话吗？","source":"02-memory.md","status":"answered","terms":["显式","不会"]},
+  {"id":"checkpoint","question":"LangGraph 检查点与 SQLite 账本谁负责执行状态？","source":"03-runtime.md","status":"answered","terms":["权威来源","幂等"]},
+  {"id":"deadline","question":"总 deadline 包含哪些阶段？","source":"03-runtime.md","status":"answered","terms":["排队","最初"]},
+  {"id":"unknown","question":"外部写成功但收据丢失怎么办？","source":"03-runtime.md","status":"answered","terms":["needs_reconciliation","禁止"]},
+  {"id":"orion","question":"Orion 服务超时时间是多少？","source":"04-systems.md","status":"answered","terms":["8 秒","Orion"]},
+  {"id":"atlas","question":"Atlas 服务超时时间是多少？","source":"04-systems.md","status":"answered","terms":["12 秒","Atlas"]},
+  {"id":"negation","question":"生产环境批准外网访问了吗？","source":"04-systems.md","status":"answered","terms":["未批准"]},
+  {"id":"noanswer","question":"月球酒店的私人电话号码？","source":null,"status":"refused","terms":[]}
+]
