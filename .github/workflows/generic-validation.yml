@@ -85,6 +85,18 @@ jobs:
                         archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
                         source_baseline=fingerprint(target, names))
           (evidence / 'source.json').write_text(json.dumps(record, indent=2), encoding='utf-8')
+      - name: Isolate verification dependencies from runner tools
+        if: matrix.mode != 'docker'
+        shell: python
+        run: |
+          import os, sys, venv
+          from pathlib import Path
+          target = Path(os.environ['RUNNER_TEMP']) / 'verification-venv'
+          assert not target.exists()
+          venv.EnvBuilder(with_pip=True, system_site_packages=False).create(target)
+          binaries = target / ('Scripts' if sys.platform == 'win32' else 'bin')
+          with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as path:
+              path.write(str(binaries) + '\n')
       - name: Install exact reviewed development pins
         if: matrix.mode != 'docker'
         working-directory: ${{ runner.temp }}/reviewed-export
