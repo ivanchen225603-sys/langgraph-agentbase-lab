@@ -110,11 +110,31 @@ jobs:
         working-directory: ${{ runner.temp }}/reviewed-export
         shell: python
         run: |
-          import json, subprocess, sys
+          import json, re, subprocess, sys
           from pathlib import Path
+          from packaging.utils import canonicalize_name
+          from packaging.version import InvalidVersion, Version
           def pins(name):
-              return dict(line.lower().replace('_', '-').split('==')
-                          for line in Path(name).read_text().splitlines())
+              result = {}
+              for number, raw in enumerate(Path(name).read_text(encoding='utf-8').splitlines(), 1):
+                  line = raw.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  match = re.fullmatch(r'([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==([A-Za-z0-9][A-Za-z0-9.!+_-]*)', line)
+                  if not match:
+                      raise ValueError(f'{name}:{number}: unsupported or invalid exact pin')
+                  package, version = match.groups()
+                  try:
+                      Version(version)
+                  except InvalidVersion as error:
+                      raise ValueError(f'{name}:{number}: invalid pinned version') from error
+                  package = canonicalize_name(package)
+                  if package in result:
+                      raise ValueError(f'{name}:{number}: duplicate dependency')
+                  result[package] = version
+              if not result:
+                  raise ValueError(f'{name}: empty dependency lock')
+              return result
           development, runtime = pins('requirements-dev.lock'), pins('requirements.lock')
           assert all(development.get(name) == version for name, version in runtime.items())
           argv = [sys.executable, '-m', 'pip_audit', '-r', 'requirements-dev.lock', '--no-deps',
@@ -129,7 +149,7 @@ jobs:
           report = json.loads(Path('evidence/ci/audit.json').read_text())
           dependencies = report['dependencies']
           assert len(dependencies) == len(development)
-          assert {x['name'].lower().replace('_', '-'): x['version'] for x in dependencies} == development
+          assert {canonicalize_name(x['name']): x['version'] for x in dependencies} == development
           assert all(not x.get('skip_reason') and not x['vulns'] for x in dependencies)
       - name: Validate non-production Docker service
         if: matrix.mode == 'docker'
