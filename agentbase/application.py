@@ -2,7 +2,7 @@
 
 import asyncio
 import importlib
-import os
+import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -50,7 +50,7 @@ class RuntimeProcessLock:
                 handle.write(b"0")
                 handle.flush()
             handle.seek(0)
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)

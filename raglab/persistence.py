@@ -1,7 +1,7 @@
 import hashlib
 import json
-import os
 import sqlite3
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,7 +40,7 @@ class ProcessLock:
             self.file.flush()
         self.file.seek(0)
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
