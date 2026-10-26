@@ -715,12 +715,21 @@ async def test_synchronous_slow_hook_rolls_back_before_handler(ledger):
 
 
 @pytest.mark.parametrize("write", [False, True])
-async def test_synchronous_slow_handler_cannot_publish_after_deadline(ledger, write):
+async def test_synchronous_slow_handler_cannot_publish_after_deadline(ledger, write, monkeypatch):
     invoked = []
+    loop = asyncio.get_running_loop()
+    started = time.time()
+    wall, monotonic = [started], [loop.time()]
+    # Isolate the handler phase from slow SQLite setup, then cross its deadline
+    # while the synchronous callback prevents the timeout callback from running.
+    monkeypatch.setattr(time, "time", lambda: wall[0])
+    monkeypatch.setattr(loop, "time", lambda: monotonic[0])
 
     async def handler(*args):
         invoked.append(1)
         blocking_extension()
+        wall[0] += 0.15
+        monotonic[0] += 0.15
         return 1
 
     executor, context, _ = configured(ledger, handler, timeout=0.1, write=write)
@@ -732,6 +741,7 @@ async def test_synchronous_slow_handler_cannot_publish_after_deadline(ledger, wr
         assert (await executor.execute(context, call())).error == "tool_timeout"
         assert operation(ledger)["phase"] == "failed"
     assert invoked == [1] and operation(ledger)["attempts"] == 1
+    assert operation(ledger)["call_deadline"] == started + 0.1
 
 
 async def test_synchronous_slow_projection_keeps_applied_fact_without_publishing(ledger):
